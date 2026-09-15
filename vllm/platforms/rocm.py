@@ -225,6 +225,7 @@ _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
 _ON_GFX1250 = "gfx1250" in _GCN_ARCH
+_ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
 
 _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 # RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
@@ -377,7 +378,7 @@ if (
     envs.VLLM_ROCM_USE_AITER
     and envs.VLLM_ROCM_USE_AITER_LINEAR
     and envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
-    and get_cdna_version() > 2
+    and (get_cdna_version() > 2 or on_rdna4())
 ):
     os.environ["HIP_ONLINE_TUNING"] = "1"
 
@@ -412,12 +413,12 @@ def use_rocm_custom_paged_attention(
             _ON_GFX1X
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
-            and head_size == 128
-            and block_size == 16
-            and (gqa_ratio >= 3 and gqa_ratio <= 16)
+            and head_size in (64, 128, 256)
+            and block_size in (16, 32)
+            and (gqa_ratio >= 1 and gqa_ratio <= 16)
             and max_seq_len <= 128 * 1024
             and alibi_slopes is None
-            and kv_cache_dtype == "auto"
+            and kv_cache_dtype in ("auto", "fp8", "fp8_e4m3")
             and sinks is None
         )
 
@@ -461,7 +462,11 @@ def _get_backend_priorities(
     use_sparse: bool,
     use_kv_connector: bool = False,
 ) -> list[AttentionBackendEnum]:
-    from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
+    from vllm._aiter_ops import (
+        is_aiter_found_and_supported,
+        is_aiter_found_and_supported_on_rdna4,
+        rocm_aiter_ops,
+    )
 
     if use_sparse:
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
@@ -485,7 +490,7 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
-    if is_aiter_found_and_supported():
+    if is_aiter_found_and_supported() or is_aiter_found_and_supported_on_rdna4():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     elif rocm_aiter_ops.is_rdna_aiter_enabled():
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
@@ -986,8 +991,8 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        # MI300 series plus gfx1201 (RDNA4, aiter module_custom_all_reduce verified)
+        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95", "gfx1201"])
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
@@ -1113,11 +1118,25 @@ class RocmPlatform(Platform):
 
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.
         # TODO(luka/TJ) remove env vars completely
+            # aiter rms_norm / fused_add_rms_norm re-enabled for RDNA4.
+            # Enabled surface audited: ir ops rms_norm + fused_add_rms_norm
+            # only -> aiter opus HIP kernels (aiter/csrc/kernels/rmsnorm/*, arch-agnostic,
+            # JIT-compiled). NOT the ck/cktile GEMM family (SIGSEGV precedent not on this
+            # path). Constraint fallbacks: fp16/bf16 only, no variance_size override,
+            # weight dtype must match. GemmaRMSNorm unaffected (no aiter impl).
+            # Fused AR+rmsnorm (#54787 path) is gated separately by
+            # is_custom_all_reduce_enabled, not by this gate.
+        # aiter rmsnorm is only safe when AITER_CUSTOM (which
+        # carries the publish-then-reduce fix) is the live custom-AR
+        # backend; otherwise force native to avoid non-temporal loads reading
+        # AR output still resident in L2 (garbled output on gfx1201).
+        from vllm._aiter_ops import rocm_aiter_ops
+        ar_has_aiter_custom = bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
         if (
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
-            and not on_rdna4()
+            and ar_has_aiter_custom
         ):
             rms_norm = ["aiter"] + default
         else:

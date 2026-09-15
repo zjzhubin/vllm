@@ -1593,6 +1593,15 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
             max_token_num,
             config.scheduler_config.max_num_batched_tokens,
         )
+        # routing gate: restrict the fused pass to token counts
+        # where the publish-then-reduce kernel is a net win (microbenchmark:
+        # m<=48 wins, m>=64 loses). Ranges above the gate fall back to the
+        # unfused bare-AR + standalone norm path. Absent table -> no gate.
+        from vllm._aiter_ops import routing as ar_routing
+
+        gate = ar_routing.fused_ar_rms_token_gate()
+        if gate is not None:
+            self.max_token_num = min(self.max_token_num, gate)
 
         # Only register the AR+RMS+per-group-FP8-quant patterns when the
         # running aiter exposes the kernel. Older aiter builds (pre PR #2823)

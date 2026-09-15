@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
+    VLLM_ROCM_FP8_BLOCK_DEQUANT: bool = False
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1364,6 +1365,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
     # Pad the weights for the moe kernel
     "VLLM_ROCM_MOE_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_PADDING", "1"))),
+    # Dequant block-quantized FP8 weights to BF16 at load time for the MTP
+    # layers only (Qwen3_5MTP/Qwen3_5MoeMTP). The main model keeps the FP8
+    # blockscale fast path and is never dequantized.
+    "VLLM_ROCM_FP8_BLOCK_DEQUANT": lambda: bool(
+        int(os.getenv("VLLM_ROCM_FP8_BLOCK_DEQUANT", "0"))
+    ),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
