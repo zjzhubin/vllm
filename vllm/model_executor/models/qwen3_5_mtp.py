@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 from collections.abc import Iterable
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
@@ -232,25 +234,44 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 "please use '--mamba-cache-mode=align' instead"
             )
 
+        # with VLLM_ROCM_FP8_BLOCK_DEQUANT, dequantize
+        # block-quantized FP8 weights to BF16 only for the MTP layers (they
+        # are tiny). The main model keeps the FP8 blockscale fast path.
+        # Never mutate the shared target quant config; install a flagged
+        # copy for the duration of MTP construction.
+        original_quant = vllm_config.quant_config
+        if (
+            original_quant is not None
+            and envs.VLLM_ROCM_FP8_BLOCK_DEQUANT
+            and original_quant.get_name() == "fp8"
+            and getattr(original_quant, "weight_block_size", None) is not None
+        ):
+            mtp_quant = copy.copy(original_quant)
+            mtp_quant.dequant_block_weights = True
+            vllm_config.quant_config = mtp_quant
+
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
         self.config = config
-        self.model = Qwen3_5MultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
-        )
-
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
+        try:
+            self.model = Qwen3_5MultiTokenPredictor(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
             )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-        else:
-            self.lm_head = PPMissingLayer()
+
+            if get_pp_group().is_last_rank:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
+                if config.tie_word_embeddings:
+                    self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+            else:
+                self.lm_head = PPMissingLayer()
+        finally:
+            vllm_config.quant_config = original_quant
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 

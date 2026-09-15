@@ -284,10 +284,16 @@ class Sampler(nn.Module):
             logits = processor.apply(logits)
 
         # Apply top_k and/or top_p.
+        # when the scheduler already folded top_k to a scalar
+        # (top_k_scalar), pass it instead of the per-token tensor so the aiter
+        # sampler avoids a per-call unique()/D2H sync.
+        top_k_arg = sampling_metadata.top_k
+        if sampling_metadata.top_k_scalar is not None:
+            top_k_arg = sampling_metadata.top_k_scalar
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,
-            sampling_metadata.top_k,
+            top_k_arg,
             sampling_metadata.top_p,
         )
 

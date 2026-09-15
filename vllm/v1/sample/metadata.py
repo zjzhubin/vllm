@@ -53,3 +53,8 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+
+    # scalar fold of top_k when all requests share the same value
+    # (CPU-side, computed once per step in gpu_input_batch). Lets the aiter
+    # sampler take the scalar path and skip a per-call unique()/D2H sync.
+    top_k_scalar: int | None = None

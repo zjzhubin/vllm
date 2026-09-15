@@ -585,13 +585,18 @@ class SpeculativeConfig:
             )
         return SpeculativeConfig._acceptance_length_to_rates(length, n)
 
-    draft_sample_method: DraftSampleMethod = "greedy"
+    draft_sample_method: DraftSampleMethod | None = None
     """How the draft model samples tokens. 'greedy' always picks the argmax
     token, and the draft probabilities are treated as one-hot during rejection
     sampling. 'probabilistic' samples stochastically from the draft
     distribution and uses the full draft logits for the probability ratio test
     during rejection sampling. This comes at the cost of additional GPU memory
-    usage."""
+    usage.
+
+    When None, it is derived from the speculative method: 'probabilistic' for
+    dflash (whose gumbel-aligned rejection sampling requires the draft to draw
+    from its own distribution), and 'greedy' for every other method. Explicitly
+    passing this argument overrides the derivation."""
 
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
@@ -1521,6 +1526,15 @@ class SpeculativeConfig:
 
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")
+
+        if self.draft_sample_method is None:
+            # DFlash2's gumbel-aligned rejection sampling requires the draft to
+            # draw from its own distribution, so default to probabilistic for
+            # dflash and greedy everywhere else. Explicitly passing
+            # draft_sample_method overrides this derivation.
+            self.draft_sample_method = (
+                "probabilistic" if self.method == "dflash" else "greedy"
+            )
 
         return self
 

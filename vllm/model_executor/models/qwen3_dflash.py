@@ -26,6 +26,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    unpack_quantized_values_into_int32,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -53,6 +56,52 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+def _dequant_linear_kv_weight(qkv_proj: QKVParallelLinear, q_size: int) -> torch.Tensor:
+    """Return the BF16 KV-projection slice [2*kv_size, hidden] of a qkv_proj.
+
+    Unquantized layers expose `.weight` directly; quantized layers
+    (compressed-tensors W4A16) expose weight_packed + weight_scale and are
+    dequantized here so DFlash's fused context-KV projection runs unchanged.
+    """
+    weight = getattr(qkv_proj, "weight", None)
+    if weight is not None:
+        weight_scale_inv = getattr(qkv_proj, "weight_scale_inv", None)
+        if weight_scale_inv is not None and weight.dtype == torch.float8_e4m3fn:
+            # Block-quantized FP8 draft (F8_E4M3 weights + weight_scale_inv,
+            # block N x K). Dequantize the KV rows at load time so the fused
+            # context-KV F.linear (bf16 activations) receives bf16 weights.
+            # Mirrors the block-scale math in
+            # Fp8LinearMethod.process_weights_after_loading.
+            block_n, block_k = qkv_proj.weight_block_size
+            num_rows, num_cols = weight.shape
+            scales = weight_scale_inv.to(torch.float32).repeat_interleave(
+                block_n, dim=0
+            ).repeat_interleave(block_k, dim=1)[:num_rows, :num_cols]
+            dequant = (weight.to(torch.float32) * scales).to(torch.bfloat16)
+            return dequant[q_size:]
+        return weight.data[q_size:]
+
+    if getattr(qkv_proj, "weight_zero_point", None) is not None:
+        raise NotImplementedError(
+            "DFlash KV fusion only supports symmetric W4A16 draft weights"
+        )
+    scheme = qkv_proj.scheme
+    group_size = getattr(scheme, "group_size", 128)
+    unpacked = unpack_quantized_values_into_int32(
+        qkv_proj.weight_packed.data,
+        scheme.quant_type,
+        packed_dim=qkv_proj.weight_packed.packed_dim,
+    ).to(torch.float32)
+    unpacked -= 2 ** (scheme.num_bits - 1)
+    scales = qkv_proj.weight_scale.data
+    if scales.shape[1] == unpacked.shape[1]:
+        scales = scales.repeat(1, unpacked.shape[1])
+    else:
+        scales = scales.repeat_interleave(group_size, dim=1)
+    return (unpacked * scales).to(torch.bfloat16)[q_size:]
+
+
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -469,7 +518,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [_dequant_linear_kv_weight(a.qkv_proj, a.q_size) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]

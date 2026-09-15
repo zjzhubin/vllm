@@ -18,11 +18,18 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 
-def _skip_aiter_sampler_on_gfx1250() -> bool:
+def _skip_aiter_sampler_on_gfx12() -> bool:
     # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
-    from vllm.platforms.rocm import on_gfx1250
-
-    return on_gfx1250()
+    # gfx1201 已修复（aiter vec_dtypes.cuh half→fp8 cast 改 device 构造）；
+    # gfx1250 上游仍 skip（TODO 待启用）。
+    # RDNA_AITER_SAMPLER=1 显式启用（A/B 用）；默认禁用。
+    # A/B 实测：aiter sampler 在 conc=1/3 decode 回退 -6~8%
+    # （27.34/77.77 vs 29.64/83.21），conc=6 持平。维持 forward_native。
+    import os
+    if os.environ.get("RDNA_AITER_SAMPLER", "0") == "1":
+        from vllm.platforms.rocm import on_gfx1250
+        return on_gfx1250()
+    return True
 
 
 def flashinfer_sampler_supported() -> bool:
@@ -117,7 +124,7 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in PROCESSED_LOGPROBS_MODES
             and rocm_aiter_ops.is_enabled()
-            and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable
+            and not _skip_aiter_sampler_on_gfx12()  # gfx12 sampler 编译失败，显性禁用
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
@@ -132,14 +139,21 @@ class TopKTopPSampler(nn.Module):
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
-        k: torch.Tensor | None,
+        k: torch.Tensor | int | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
+        if isinstance(k, int):
+            # scalar top_k folded by the scheduler; expand back to a
+            # per-token tensor so apply_top_k_top_p (pytorch/triton) is unchanged.
+            k = torch.full(
+                (logits.shape[0],), k, dtype=torch.long, device=logits.device
+            )
         logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
@@ -231,7 +245,7 @@ class TopKTopPSampler(nn.Module):
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
-        k: torch.Tensor | None,
+        k: torch.Tensor | int | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Optimized ROCm/aiter path (same structure as forward_cuda)."""
@@ -254,7 +268,7 @@ class TopKTopPSampler(nn.Module):
     def aiter_sample(
         self,
         logits: torch.Tensor,
-        k: torch.Tensor | None,
+        k: torch.Tensor | int | None,
         p: torch.Tensor | None,
         generators: dict[int, torch.Generator],
     ) -> torch.Tensor:
