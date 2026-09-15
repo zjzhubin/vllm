@@ -320,46 +320,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        qr_comm = self.qr_comm
-        if (
-            qr_comm is not None
-            and not qr_comm.disabled
-            and qr_comm.should_quick_allreduce(input_)
-        ):
-            out = qr_comm.quick_all_reduce(input_)
-            assert out is not None
-            return out
-        fi_pcie_ipc_ar_comm = self.fi_pcie_ipc_ar_comm
-        if fi_pcie_ipc_ar_comm is not None and fi_pcie_ipc_ar_comm.should_use(input_):
-            return fi_pcie_ipc_ar_comm.all_reduce(input_)
-        if use_fi_ar:
-            assert fi_ar_comm is not None
-            out = fi_ar_comm.all_reduce(input_)
-            assert out is not None
-            return out
-        aiter_ar_comm = self.aiter_ar_comm
-        if (
-            aiter_ar_comm is not None
-            and not aiter_ar_comm.disabled
-            and aiter_ar_comm.should_custom_ar(input_)
-        ):
-            out = aiter_ar_comm.custom_all_reduce(input_)
-            assert out is not None
-            return out
-        ca_comm = self.ca_comm
-        if (
-            ca_comm is not None
-            and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
-        ):
-            out = ca_comm.custom_all_reduce(input_)
-            assert out is not None
-            return out
-        symm_mem_comm = self.symm_mem_comm
-        if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
-            out = symm_mem_comm.all_reduce(input_)
-            assert out is not None
-            return out
+        # Backend dispatch order and per-backend byte windows come from the
+        # routing table (aiter.dist.routing). Unrouted / absent table
+        # yields the historical order: QUICK_REDUCE, FLASHINFER_PCIE, FLASHINFER,
+        # AITER_CUSTOM, CUSTOM, SYMM_MEM, then PYNCCL as terminal fallback.
+        # Routing can only reorder/disable the tried backends, never invent
+        # new ones.
+        from vllm._aiter_ops import routing as ar_routing
+
+        nbytes = input_.numel() * input_.element_size()
+        candidates = (
+            ("QUICK_REDUCE", self.qr_comm,
+             lambda c: c.should_quick_allreduce(input_),
+             lambda c: c.quick_all_reduce(input_)),
+            ("FLASHINFER_PCIE", self.fi_pcie_ipc_ar_comm,
+             lambda c: c.should_use(input_),
+             lambda c: c.all_reduce(input_)),
+            ("FLASHINFER", self.fi_ar_comm,
+             lambda c: c.should_use_fi_ar(input_),
+             lambda c: c.all_reduce(input_)),
+            ("AITER_CUSTOM", self.aiter_ar_comm,
+             lambda c: c.should_custom_ar(input_),
+             lambda c: c.custom_all_reduce(input_)),
+            ("CUSTOM", self.ca_comm,
+             lambda c: c.should_custom_ar(input_),
+             lambda c: c.custom_all_reduce(input_)),
+            ("SYMM_MEM", self.symm_mem_comm,
+             lambda c: c.should_use_symm_mem(input_),
+             lambda c: c.all_reduce(input_)),
+        )
+        order = ar_routing.backend_order()
+        keyed = [
+            (order.index(name) if name in order else len(order) + i,
+             name, comm, accept, run)
+            for i, (name, comm, accept, run) in enumerate(candidates)
+        ]
+        for _, name, comm, accept, run in sorted(keyed, key=lambda t: t[0]):
+            if comm is None:
+                continue
+            if (
+                not getattr(comm, "disabled", False)
+                and ar_routing.backend_gate(name, nbytes)
+                and accept(comm)
+            ):
+                out = run(comm)
+                assert out is not None
+                return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
