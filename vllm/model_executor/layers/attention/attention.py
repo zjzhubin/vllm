@@ -514,9 +514,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype.startswith("nvfp4")
             )
 
-            # check if query quantization is supported
-            if self.impl.supports_quant_query_input:
-                query, _ = self.query_quant(query, self._q_scale)
+            # query_quant is only built when supports_quant_query_input is
+            # set (see __init__), so no per-forward re-check is needed.
+            query, _ = self.query_quant(query, self._q_scale)
 
         if output_shape is None:
             # Handle both 2D [num_tokens, hidden] and

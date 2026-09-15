@@ -243,9 +243,18 @@ def apply_sdpa(
     (batch_size x seq_len x num_heads x head_size)
     """
     q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
-    output = F.scaled_dot_product_attention(
-        q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
-    )
+    if current_platform.is_rocm():
+        # HIP flash SDPA 对 head_dim=256 + GQA 报 hipErrorInvalidValue，强制 math backend
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with sdpa_kernel(SDPBackend.MATH):
+            output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
+            )
+    else:
+        output = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
+        )
     output = einops.rearrange(output, "b h s d -> b s h d ")
     return output
 

@@ -31,6 +31,31 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 logger = init_logger(__name__)
 
+try:
+    from triton.runtime.errors import OutOfResources as _TritonOutOfResources
+except ImportError:
+    _TritonOutOfResources = None
+
+
+def _is_lds_overflow_error(exc: BaseException) -> bool:
+    """Check whether an exception is Triton's shared-memory (LDS) overflow.
+
+    Matches on the exception class when Triton exposes it, falling back to a
+    message match otherwise: the class has moved across Triton versions but
+    the message text has not. The fallback requires both markers so it cannot
+    swallow an unrelated failure such as a register overflow.
+
+    Args:
+        exc: Exception raised while launching a Triton kernel.
+
+    Returns:
+        True if the exception reports exhausted shared memory.
+    """
+    if _TritonOutOfResources is not None and isinstance(exc, _TritonOutOfResources):
+        return True
+    msg = str(exc).lower()
+    return "out of resource" in msg and "shared memory" in msg
+
 
 class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
     def build_for_cudagraph_capture(
@@ -81,8 +106,25 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
         return True
 
     @classmethod
+    def supports_sliding_window(cls) -> bool:
+        # Explicit (was inherited from RocmAttentionBackend): forward() passes
+        # window_size=self.sliding_window to the aiter kernel and the Triton
+        # non-causal fallback alike.
+        return True
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
-        return False
+        # Non-causal attention (DFlash draft layers, encoder-decoder) falls back
+        # to the vLLM Triton unified kernel in forward(), which honors the flag
+        # and supports bidirectional sliding window.
+        return True
+
+    @classmethod
+    def supports_kv_connector(cls) -> bool:
+        # UA backend uses a blocks-first KV cache layout
+        # ((num_blocks, num_kv_heads, block_size, 2*hs)), which is compatible
+        # with KV connectors, unlike ROCM_ATTN's (2, num_blocks, ...) layout.
+        return True
 
     forward_includes_kv_cache_update: bool = False
 
@@ -250,27 +292,43 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         block_table = attn_metadata.block_table
 
         if attn_metadata.causal:
-            self.unified_attention(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-                k_descale=layer._k_scale,
-                v_descale=layer._v_scale,
-                sinks=self.sinks,
-                output_scale=output_scale,
-            )
+            try:
+                self.unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
+                    k_descale=layer._k_scale,
+                    v_descale=layer._v_scale,
+                    sinks=self.sinks,
+                    output_scale=output_scale,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not _is_lds_overflow_error(exc):
+                    raise
+                # Fail loud: LDS overflow on gfx1201 is a configuration defect
+                # (attn_stages / TILE_SIZE), not a supported fallback. This port
+                # deliberately avoids the silent in-tree fallback so any config
+                # leak surfaces here instead of degrading quietly.
+                logger.error(
+                    "LDS overflow detected in aiter unified-attention 3D "
+                    "kernel (head_size=%s, num_heads=%s): failing loud, no "
+                    "silent fallback.",
+                    self.head_size,
+                    self.num_heads,
+                )
+                raise
         else:
             # The aiter kernel is causal-only. Non-causal cross-attention
             # (ENCODER_DECODER, e.g. Whisper) falls back to the vLLM Triton
