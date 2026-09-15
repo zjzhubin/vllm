@@ -2203,6 +2203,14 @@ def wvSplitK_int4_g(
     )
 
 
+def mx4_gemv(
+    activation: torch.Tensor,      # [1, K] bf16
+    weight: torch.Tensor,          # packed fp4 [N, K/2] uint8
+    scale: torch.Tensor,           # e8m0 [N, K/32] uint8
+) -> torch.Tensor:
+    return torch.ops._rocm_C.mx4_gemv(activation, weight, scale)
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"):
 
     @register_fake("_rocm_C::wvSplitK_int4_g")

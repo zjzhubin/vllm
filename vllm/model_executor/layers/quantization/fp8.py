@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -135,6 +136,10 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
         self.use_deep_gemm: bool | None = None
+        # ROCm RDNA4 fallback: dequantize block-quantized FP8 weights to BF16
+        # at load time for selected layers only (MTP). The main model keeps
+        # the FP8 blockscale fast path.
+        self.dequant_block_weights = False
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -274,6 +279,9 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
+        # Per-layer opt-in to dequant block-quantized FP8 weights to BF16 at
+        # load time (set for MTP layers only); see Fp8Config.dequant_block_weights.
+        self.dequant = getattr(self.quant_config, "dequant_block_weights", False)
 
         if self.block_quant:
             assert not self.act_q_static
@@ -401,6 +409,32 @@ class Fp8LinearMethod(LinearMethodBase):
         # TODO(rob): refactor block quant into separate class.
         if self.block_quant:
             assert not self.act_q_static
+            if self.dequant:
+                # Dequantize block-quantized FP8 weights to BF16 at load time.
+                # Official FP8 checkpoints publish block-quantized weights
+                # (F8_E4M3 + weight_scale_inv, block N x K), which the block
+                # scale GEMM kernels handle poorly on RDNA4. This mirrors the
+                # VLLM_BATCH_INVARIANT per-tensor/channel dequant fallback.
+                # Gated per-layer via Fp8Config.dequant_block_weights so that
+                # only the MTP layers are dequantized; the main model keeps
+                # the FP8 blockscale fast path.
+                block_n, block_k = self.weight_block_size
+                weight_fp8 = layer.weight  # [N, K] float8_e4m3fn
+                N, K = weight_fp8.shape
+                ws = layer.weight_scale_inv  # [ceil(N/block_n), ceil(K/block_k)]
+                if ws.dtype == torch.float8_e8m0fnu:
+                    ws = _upcast_e8m0_to_fp32(ws)
+                else:
+                    ws = ws.to(torch.float32)
+                ws_expanded = ws.repeat_interleave(block_n, dim=0).repeat_interleave(
+                    block_k, dim=1
+                )[:N, :K]
+                weight_bf16 = (weight_fp8.to(torch.float32) * ws_expanded).to(
+                    torch.bfloat16
+                )
+                replace_parameter(layer, "weight", weight_bf16.data)
+                layer.weight_scale_inv = None
+                return
 
         # If checkpoint not serialized fp8, quantize the weights.
         else:
@@ -439,6 +473,10 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Block-quantized weights were dequantized to BF16 [N, K] at load time
+        # (Fp8Config.dequant_block_weights, MTP layers only): plain BF16 GEMM.
+        if self.block_quant and self.dequant:
+            return torch.nn.functional.linear(x, layer.weight, bias)
         # if batch invariant mode is enabled, prefer direct FP8 path
         # we will use BF16 dequant when direct FP8 is not supported.
         if envs.VLLM_BATCH_INVARIANT:

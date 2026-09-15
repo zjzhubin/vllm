@@ -59,6 +59,14 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        # Plan B gate: CK int8 GEMM (gemm_a8w8_CK) is CDNA-only; on RDNA4 it
+        # hard-fails at runtime ("This GEMM is not supported"). Fall through
+        # to the torch W8A8 path (same pattern as the preshuffled FP8 kernel).
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_rdna4
+
+            if on_rdna4():
+                return False, "not supported on RDNA4 (gfx1200/gfx1201)."
         if not c.input_symmetric:
             return False, "supports symmetric quantization only."
         return True, None
@@ -151,6 +159,14 @@ class AiterPreshuffledPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        # RDNA4 (gfx1200/gfx1201) has no working CK bpreshuffle GEMM: the
+        # shuffled per-token kernel crashes at runtime there. Fall through to
+        # the torch W8A8-FP8 path (ChannelWiseTorch).
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_rdna4
+
+            if on_rdna4():
+                return False, "not supported on RDNA4 (gfx1200/gfx1201)."
         is_ptpc = (
             c.activation_quant_key.scale.group_shape.is_per_token()
             and c.weight_quant_key.scale.group_shape.is_per_channel()
@@ -243,6 +259,14 @@ class AiterHipbMMPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        # RDNA4 (gfx1200/gfx1201): hipb_mm's bpreshuffle (COL16_4R16) has no
+        # hipBLASLt kernel for large-N prefill shapes. Fall through to
+        # AiterPerTokenFp8ScaledMMLinearKernel (plain Triton gemm_a8w8).
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_rdna4
+
+            if on_rdna4():
+                return False, "hipb_mm bpreshuffle has no kernel on RDNA4."
         is_ptpc = (
             c.activation_quant_key.scale.group_shape.is_per_token()
             and c.weight_quant_key.scale.group_shape.is_per_channel()
@@ -335,14 +359,21 @@ class AiterPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                 "requires per token activation scales and per channel weight scales.",
             )
 
-        # Aiter's per-token Gemm performs better than torch oonly when its
-        # tuned.
+        # Aiter's per-token Gemm performs better than torch only when its
+        # tuned. On RDNA4 there is no tuned CK config; the portable Triton
+        # gemm_a8w8 needs no tuning gate.
         if not rocm_aiter_ops.is_per_token_w8a8_gemm_tuned(N, K, fp8_dtype):
-            return (
-                False,
-                f"requires a tuned configuration for N: {N} and K: {K} "
-                f"and fp8 dtype {fp8_dtype}.",
-            )
+            on_rdna4_flag = False
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_rdna4
+
+                on_rdna4_flag = on_rdna4()
+            if not on_rdna4_flag:
+                return (
+                    False,
+                    f"requires a tuned configuration for N: {N} and K: {K} "
+                    f"and fp8 dtype {fp8_dtype}.",
+                )
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

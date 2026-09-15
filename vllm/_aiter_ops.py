@@ -25,6 +25,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 try:
+    from aiter.dist import routing
+except ImportError:  # pragma: no cover - aiter optional in vllm envs
+    # runtime AR routing table lives in the aiter fork
+    # (aiter/dist/routing.py); re-exported for cuda_communicator and
+    # allreduce_rms_fusion backend dispatch.
+    routing = PlaceholderModule("aiter.dist.routing")
+
+try:
     import pandas as pd
 except ImportError:
     pd = PlaceholderModule("pandas")
@@ -203,7 +211,10 @@ def if_aiter_supported(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        if is_aiter_found_and_supported():
+        if (
+            is_aiter_found_and_supported()
+            or is_aiter_found_and_supported_on_rdna4()
+        ):
             return func(*args, **kwargs)
 
         return None
@@ -736,13 +747,11 @@ def _rocm_aiter_w8a8_gemm_impl(
     bias: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    from aiter import gemm_a8w8_CK
+    from aiter import gemm_a8w8
 
-    # gemm_a8w8_CK(a, b, scale_a, scale_b, bias) expects
-    # a to be [M, K]
-    # b to be [N, K]
-    # CutlassInt8ScaledMMLinearKernel prepare weight `w_q` in [K, N] format
-    return gemm_a8w8_CK(A, B, As, Bs, bias, output_dtype)
+    # gemm_a8w8 dispatcher: CK on gfx9, portable Triton on RDNA (gfx11/gfx12).
+    # A is [M, K], B is [N, K], As per-token [M,1], Bs per-channel [1,N].
+    return gemm_a8w8(A, B, As, Bs, bias, output_dtype)
 
 
 def _rocm_aiter_w8a8_gemm_fake(
@@ -3150,6 +3159,14 @@ class rocm_aiter_ops:
             (24576, 1536),
             (32768, 512),
             (36864, 7168),
+            # the 5 MTP projection shapes of Qwen3.8-27B
+            # (fc/qkv/gate_up/down/lm_head at TP=1) so block-quantized MTP
+            # GEMMs take the Triton blockscale kernel. On gfx1201 the aiter
+            # blockscale dispatcher already falls back to Triton, so these
+            # only matter for CDNA-class arches.
+            (1024, 5120),
+            (12288, 5120),
+            (17408, 5120),
         }
         if on_rdna4():
             return (n, k) in rdna4_tuned
