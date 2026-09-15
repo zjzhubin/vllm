@@ -103,7 +103,7 @@ docker run -it --rm \
   --group-add video --ipc=host --shm-size 16g \
   -v /path/to/models:/models \
   -p 8000:8000 \
-  phase6:05-stack \
+  <your-image-tag> \
   /opt/venv/bin/vllm serve /models/<your-model> \
       --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
 ```
@@ -419,7 +419,7 @@ docker run -it --rm \
   --group-add video --ipc=host --shm-size 16g \
   -v /path/to/models:/models \
   -p 8000:8000 \
-  phase6:05-stack \
+  <your-image-tag> \
   /opt/venv/bin/vllm serve /models/<你的模型> \
       --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
 ```
