@@ -38,6 +38,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
+  // MXFP4 GEMV: warp-per-row direct e2m1 consumption, e8m0 in-kernel scales
+  rocm_ops.def(
+      "mx4_gemv(Tensor in_a, Tensor in_b, Tensor in_scale) -> Tensor");
+  rocm_ops.impl("mx4_gemv", torch::kCUDA, &mx4_gemv);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

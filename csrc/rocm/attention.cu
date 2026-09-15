@@ -3790,6 +3790,9 @@ void paged_attention_custom_launcher_navi(
     case 128:                                                      \
       CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128, MFMA_TYPE);  \
       break;                                                       \
+    case 256:                                                      \
+      CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 256, MFMA_TYPE);  \
+      break;                                                       \
     default:                                                       \
       TORCH_CHECK(false, "Unsupported head size: ", head_size);    \
       break;                                                       \
