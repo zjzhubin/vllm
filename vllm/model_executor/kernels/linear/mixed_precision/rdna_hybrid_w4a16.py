@@ -267,7 +267,14 @@ def triton_w4a16_skinny_fmt_gemm(
             elif N >= 4 * K:  # very wide N (e.g. gate_up_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 256, 64, 64, 8
             else:
-                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 32, 8
+                # Qwen3.8 prefill 实测 (BLOCK_K=32 钳位下)
+                # 256,128,32,8 最优（9/10 形状，kernel 级 +9.7%；M=895 +3-7%, M=2048 +12-14%）
+                # 旧值 128,128,32,8；env RDNA_W4A16_PREFILL_TILE=0 回退
+                import os as _os
+                if _os.environ.get("RDNA_W4A16_PREFILL_TILE", "1") == "0":
+                    BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 32, 8
+                else:
+                    BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 256, 128, 32, 8
     elif _on_gfx1151():
         # Tuned on gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts)
         # using Qwen3-4B weight shapes with group_size=128.
