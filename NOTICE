@@ -1,0 +1,12 @@
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache License 2.0.
+
+It also includes or links against the following upstream components:
+  - ROCm/aiter (MIT License)
+  - ROCm/composable_kernel (MIT License)
+  - ROCm/FlyDSL (Apache License 2.0)
+  - Dao-AILab/flash-attention (BSD 3-Clause License)
+  - ROCm/triton (MIT License)
+  - PyTorch (BSD 3-Clause License)
+
+Modifications to the above components are documented in this repository.
