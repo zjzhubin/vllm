@@ -670,6 +670,21 @@ class VllmConfig:
                 )
                 return False
 
+        # DFlash2's candidate selector and multi-KV-group
+        # drafts exist only in the V2 speculator; force V2 like dspark does.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+        ):
+            return True
+        if self._dflash_needs_multi_kv_group():
+            return True
+        if self._is_dflash2_draft():
+            return True
+
+        if self.model_config is not None and self.model_config.is_diffusion:
+            return True
+
         if not HAS_TRITON:
             logger.warning_once(
                 "Model Runner V2 requires Triton; using the V1 model runner instead."

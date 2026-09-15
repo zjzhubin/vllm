@@ -938,12 +938,23 @@ class InputBatch:
                     req_index = self.req_id_to_index[req_id]
                     logprob_token_ids_by_index[req_index] = token_ids
 
+        # fold top_k to a scalar when every request in this batch
+        # shares the same value (pure CPU/numpy, no GPU round-trip). The aiter
+        # sampler uses it to take the scalar fast-path instead of doing a
+        # per-call unique() + D2H item() sync on the tensor.
+        top_k_scalar: int | None = None
+        if not self.no_top_k:
+            vals = self.top_k_cpu[:num_reqs]
+            if vals.size > 0 and bool((vals == vals[0]).all()):
+                top_k_scalar = int(vals[0])
+
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
+            top_k_scalar=top_k_scalar,
             generators=self.generators,
             max_num_logprobs=self.max_num_logprobs,
             logprob_token_ids=logprob_token_ids_by_index,

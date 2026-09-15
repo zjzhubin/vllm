@@ -1522,6 +1522,47 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # --- local modification: KV cache group padding ---
+    # -------------------------------------------------------------------------
+    # Upstream picks group_size = min(bucket sizes) and admits in the FIXME
+    # above that this is a placeholder. On qwen3.8-27b + DFlash2 the buckets are
+    # 48 GDN + 16 full-attn + 5 drafter, so group_size lands on 5, which divides
+    # neither 48 nor 16: they pad to 50 and 20, i.e. 75 layer slots for 69 real
+    # layers. That padding is not cosmetic -- _max_memory_usage_bytes_from_groups
+    # computes group_size * sum(cdiv(spec.max_memory_usage_bytes, page)), and the
+    # 16 full-attention layers need cdiv(max_model_len, block_size) = 127 blocks
+    # per group against 6 for a GDN group, so the 16->20 padding is ~88% of the
+    # per-request budget.
+    # KV_GROUP_SIZE unset  -> stock upstream behaviour, byte-identical.
+    # KV_GROUP_SIZE=auto   -> minimise total padded slots, tie-break to FEWER
+    #                         groups, capped at KV_GROUP_MAX_GROUPS (default 32)
+    #                         so as not to trade 6 padded slots for 69 block
+    #                         tables (g=1 is slot-optimal but pathological).
+    # KV_GROUP_SIZE=<int>  -> force that group size.
+    _kv_gs = os.getenv("KV_GROUP_SIZE", "").strip().lower()
+    if _kv_gs:
+        _sizes = [len(layers) for layers in layer_buckets]
+        if _kv_gs == "auto":
+            _cap = int(os.getenv("KV_GROUP_MAX_GROUPS", "32"))
+            _best = None
+            for _g in range(1, max(_sizes) + 1):
+                _groups = sum(cdiv(_n, _g) for _n in _sizes)
+                if _groups > _cap:
+                    continue
+                _slots = sum(cdiv(_n, _g) * _g for _n in _sizes)
+                if _best is None or (_slots, _groups) < _best[0]:
+                    _best = ((_slots, _groups), _g)
+            if _best is not None:
+                group_size = _best[1]
+        else:
+            group_size = int(_kv_gs)
+        logger.info(
+            "KV_GROUP_SIZE=%s -> group_size %d for layer buckets %s "
+            "(%d padded slots for %d real layers)",
+            _kv_gs, group_size, _sizes,
+            sum(cdiv(n, group_size) * group_size for n in _sizes), sum(_sizes),
+        )
+    # --- end local modification ---
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -2120,6 +2161,33 @@ def _annotate_eagle_groups(
             for spec in iter_layer_specs(group.kv_cache_spec)
         ):
             group.is_eagle_group = True
+
+    # --- local modification: DFlash separate-draft-model group ---
+    # Fixes the "no group could be identified as the draft model's" warning on
+    # qwen3.8-27b + DFlash2. Neither rule above fires there: rule 1 needs the MLA
+    # non-causal marker (Kimi-K3 DSpark only) and rule 2 is gated to DeepseekV4.
+    # DFlash loads its drafter *after* the target model, so the drafter's
+    # attention layers register last and land in the last layer bucket; flag the
+    # group that holds the last registered layer, mirroring rule 2's positional
+    # fallback. Gated on KV_GROUP_SIZE so the stock (unset) path is unchanged.
+    if (
+        not use_deepseek_v4_fallback
+        and not any(group.is_eagle_group for group in kv_cache_groups)
+        and os.getenv("KV_GROUP_SIZE", "").strip()
+        and spec_config.use_dflash()
+    ):
+        last_layer = next(reversed(kv_cache_spec))
+        for group in kv_cache_groups:
+            if last_layer in group.layer_names:
+                group.is_eagle_group = True
+                logger.info(
+                    "KV_GROUP_SIZE draft-group annotation: flagged a %d-layer "
+                    "group (last layer %s) as the draft model's.",
+                    len(group.layer_names),
+                    last_layer,
+                )
+                break
+    # --- end local modification ---
 
     if not use_deepseek_v4_fallback:
         return
