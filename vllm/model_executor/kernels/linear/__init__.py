@@ -83,6 +83,15 @@ from vllm.model_executor.kernels.linear.mxfp4.b12x import (
 from vllm.model_executor.kernels.linear.mxfp4.emulation import (
     EmulationMxfp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp4.dequant_tgemm import (
+    DequantAiterTgemmMxfp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp4.hip_skinny import (
+    HipSkinnyMxfp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp4.hip_gemv import (
+    HipGemvMxfp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp4.flashinfer import (
     FlashInferMxFp4LinearKernel,
 )
@@ -575,6 +584,9 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         AiterMxfp4LinearKernel,
+        HipGemvMxfp4LinearKernel,
+        DequantAiterTgemmMxfp4LinearKernel,
+        HipSkinnyMxfp4LinearKernel,
         EmulationMxfp4LinearKernel,
     ],
     PlatformEnum.XPU: [
@@ -900,6 +912,27 @@ def init_mxfp4_linear_kernel(
 
     platform = current_platform._enum
     possible = list(_POSSIBLE_MXFP4_KERNELS.get(platform, []))
+
+    # --- gfx1201 W4A8 fold kernel:
+    # opt-in gfx1201 W4A8 kernel ---
+    # Env-guarded so that with RADIANCE_MXFP4_W4A8 unset this block is a no-op and
+    # _POSSIBLE_MXFP4_KERNELS[ROCM] is byte-identical to stock. The import is deferred to here,
+    # not module scope: this runs in the worker at model load (HIP already up), whereas the module
+    # is imported in the parent during config parsing, where initialising HIP would force the
+    # engine core to spawn instead of fork.
+    import os as _os
+
+    if _os.environ.get("RADIANCE_MXFP4_W4A8", "0") == "1":
+        try:
+            from vllm.model_executor.kernels.linear.mxfp4.radiance_w4a8 import (
+                kernel_class as _radiance_kernel_class,
+            )
+
+            _radiance_cls = _radiance_kernel_class()
+            if _radiance_cls is not None:
+                possible.insert(0, _radiance_cls)
+        except Exception as _radiance_exc:  # never block model load on a custom kernel
+            logger.warning_once("[radiance] MXFP4 W4A8 kernel unavailable: %r", _radiance_exc)
 
     # Apply --linear-backend filtering when set.
     possible = _resolve_backend_kernels(possible, "MXFP4")
@@ -1241,7 +1274,10 @@ __all__ = [
     "init_mxfp6_linear_kernel",
     "EmulationMxfp6LinearKernel",
     "AiterMxfp4LinearKernel",
+    "HipGemvMxfp4LinearKernel",
+    "DequantAiterTgemmMxfp4LinearKernel",
     "EmulationMxfp4LinearKernel",
+    "HipSkinnyMxfp4LinearKernel",
     "FlashInferMxFp4LinearKernel",
     "MarlinMxFp4LinearKernel",
     "FlashInferCutedslMxfp8LinearKernel",

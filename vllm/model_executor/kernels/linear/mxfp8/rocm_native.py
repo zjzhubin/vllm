@@ -203,11 +203,19 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_rocm():
             return False, "not ROCm"
-        # supports_mx() == gfx95x (CDNA4 native microscaling hardware). On other
-        # archs dot_scaled would upcast to BF16, so the kernel selector falls
-        # through to the BF16 emulation (hipBLASLt) path instead.
+        # supports_mx() was historically == gfx95x (CDNA4 native microscaling
+        # hardware). On gfx1201 (RDNA4) tl.dot_scaled is expected to lower to
+        # fp8 WMMA on the Triton gfx12 backend (to be confirmed via rocprof),
+        # so the gate is kept but overridable: default is to allow the direct
+        # path; setting VLLM_ROCM_DISABLE_DOTSCALED_MXFP8=1 forces the kernel
+        # selector to fall through to the BF16 emulation (hipBLASLt) path for
+        # controlled comparisons or regression triage.
         if not current_platform.supports_mx():
-            return False, "native MX requires CDNA4 (gfx95x)"
+            import os
+
+            if os.environ.get("VLLM_ROCM_DISABLE_DOTSCALED_MXFP8", "0") != "1":
+                return True, None
+            return False, "native MX disabled by VLLM_ROCM_DISABLE_DOTSCALED_MXFP8"
         return True, None
 
     @classmethod
