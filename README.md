@@ -237,6 +237,22 @@ aggregate output tokens/s, `c` = concurrent requests.
 
 ### 5.3 Numbers
 
+> **Two measurement windows are in play here — read the `measured` column.**
+>
+> The table below is our **first** window (2026-09-10 to 09-13). Those numbers stand exactly as
+> recorded, including the caveats in §5.4. A **second window** was run on **2026-09-15/16**,
+> re-measuring every weight format twice per concurrency level, and adding a
+> **production-form** configuration (GMU 0.92 / `--max-num-seqs 8`). Its headline results are
+> FP8 + DFlash2 at **344.9** (c12) / **324.1** (c16) agg tok/s, prefill at 32k of **3,285**
+> tok/s, and the same stack at production settings scoring c1 **68.0** / c8 **276.5**.
+>
+> **The two windows are not directly comparable to each other** — absolute values drift
+> between windows (see §5.1 and §5.4). We publish both rather than overwriting the older
+> numbers, because the earlier rows are the ones our own caveats refer to.
+>
+> Full second-window report, with a config fingerprint on every row:
+> `https://github.com/zjzhubin/vllm/blob/gfx1201-r9700/gfx1201/benchmarks/vllm-gfx1201-Phase6-%E4%B8%89%E6%A8%A1%E5%9E%8B%E5%8F%8C%E5%9C%BA%E6%99%AF%E6%B5%8B%E9%80%9F%E6%B1%87%E6%80%BB-2026-09-15.md`
+
 | Weights | Draft | decode c1 | c4 | c12 / c16 | prefill tok/s | measured | evidence |
 |---|---|---|---|---|---|---|---|
 | #1 `Qwen/Qwen3.8-27B-FP8` | DFlash2-FP8, ns=3 | **64.4** | **176.3** | 278.7 (c12) | 3,870 | 2026-09-13 | bracketed run — **anchor arms did not pass**, see §5.4 |
@@ -544,6 +560,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/health   # 期�
 `c` = 并发请求数。
 
 ### 5.3 数字
+
+> **这里有两套测量窗口——请看「测量日」这一列。**
+>
+> 下表是**第一套窗口**（2026-09-10 ~ 09-13）。这些数字**按当时记录原样保留**，包括 §5.4 的
+> 保留意见。**第二套窗口**跑于 **2026-09-15/16**：每种权重格式在每个并发档重测两遍，并补了
+> **生产形态**配置（GMU 0.92 / `--max-num-seqs 8`）。第二窗的代表数字是 FP8 + DFlash2 的
+> **344.9**（c12）/ **324.1**（c16）agg tok/s、32k prefill **3,285** tok/s，以及同一栈在生产
+> 参数下的 c1 **68.0** / c8 **276.5**。
+>
+> **两套窗口之间不可直接比较**——绝对值存在跨窗口漂移（见 §5.1 与 §5.4）。我们**两套都列**、
+> 而不是覆盖旧数字，因为上面那些保留意见指向的正是旧的那些行。
+>
+> 第二窗完整报告（每一行都带配置指纹）：
+> `https://github.com/zjzhubin/vllm/blob/gfx1201-r9700/gfx1201/benchmarks/vllm-gfx1201-Phase6-%E4%B8%89%E6%A8%A1%E5%9E%8B%E5%8F%8C%E5%9C%BA%E6%99%AF%E6%B5%8B%E9%80%9F%E6%B1%87%E6%80%BB-2026-09-15.md`
 
 | 权重 | 草稿 | decode c1 | c4 | c12 / c16 | prefill tok/s | 测量日 | 证据质量 |
 |---|---|---|---|---|---|---|---|
